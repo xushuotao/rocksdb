@@ -839,13 +839,13 @@ class MemTableInserter : public WriteBatch::Handler {
 
 public:
   // cf_mems should not be shared with concurrent inserters
-  MemTableInserter(SequenceNumber sequence, ColumnFamilyMemTables* cf_mems,
+  MemTableInserter(SequenceNumber _sequence, ColumnFamilyMemTables* cf_mems,
                    FlushScheduler* flush_scheduler,
                    bool ignore_missing_column_families,
                    uint64_t recovering_log_number, DB* db,
                    bool concurrent_memtable_writes,
                    bool* has_valid_writes = nullptr)
-      : sequence_(sequence),
+      : sequence_(_sequence),
         cf_mems_(cf_mems),
         flush_scheduler_(flush_scheduler),
         ignore_missing_column_families_(ignore_missing_column_families),
@@ -871,7 +871,7 @@ public:
 
   void set_log_number_ref(uint64_t log) { log_number_ref_ = log; }
 
-  SequenceNumber get_final_sequence() const { return sequence_; }
+  SequenceNumber sequence() const { return sequence_; }
 
   void PostProcess() {
     assert(concurrent_memtable_writes_);
@@ -1291,6 +1291,7 @@ Status WriteBatchInternal::InsertInto(WriteThread::WriteGroup& write_group,
     if (!w->ShouldWriteToMemtable()) {
       continue;
     }
+    SetSequence(w->batch, inserter.sequence());
     inserter.set_log_number_ref(w->log_ref);
     w->status = w->batch->Iterate(&inserter);
     if (!w->status.ok()) {
@@ -1301,16 +1302,17 @@ Status WriteBatchInternal::InsertInto(WriteThread::WriteGroup& write_group,
 }
 
 Status WriteBatchInternal::InsertInto(WriteThread::Writer* writer,
+                                      SequenceNumber sequence,
                                       ColumnFamilyMemTables* memtables,
                                       FlushScheduler* flush_scheduler,
                                       bool ignore_missing_column_families,
                                       uint64_t log_number, DB* db,
                                       bool concurrent_memtable_writes) {
-  MemTableInserter inserter(WriteBatchInternal::Sequence(writer->batch),
-                            memtables, flush_scheduler,
+  assert(writer->ShouldWriteToMemtable());
+  MemTableInserter inserter(sequence, memtables, flush_scheduler,
                             ignore_missing_column_families, log_number, db,
                             concurrent_memtable_writes);
-  assert(writer->ShouldWriteToMemtable());
+  SetSequence(writer->batch, sequence);
   inserter.set_log_number_ref(writer->log_ref);
   Status s = writer->batch->Iterate(&inserter);
   if (concurrent_memtable_writes) {
@@ -1324,13 +1326,12 @@ Status WriteBatchInternal::InsertInto(
     FlushScheduler* flush_scheduler, bool ignore_missing_column_families,
     uint64_t log_number, DB* db, bool concurrent_memtable_writes,
     SequenceNumber* last_seq_used, bool* has_valid_writes) {
-  MemTableInserter inserter(WriteBatchInternal::Sequence(batch), memtables,
-                            flush_scheduler, ignore_missing_column_families,
-                            log_number, db, concurrent_memtable_writes,
-                            has_valid_writes);
+  MemTableInserter inserter(Sequence(batch), memtables, flush_scheduler,
+                            ignore_missing_column_families, log_number, db,
+                            concurrent_memtable_writes, has_valid_writes);
   Status s = batch->Iterate(&inserter);
   if (last_seq_used != nullptr) {
-    *last_seq_used = inserter.get_final_sequence();
+    *last_seq_used = inserter.sequence();
   }
   if (concurrent_memtable_writes) {
     inserter.PostProcess();

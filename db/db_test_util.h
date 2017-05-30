@@ -587,9 +587,9 @@ class OnFileDeletionListener : public EventListener {
 #endif
 
 class DBTestBase : public testing::Test {
- protected:
+ public:
   // Sequence of option configurations to try
-  enum OptionConfig {
+  enum OptionConfig : int {
     kDefault = 0,
     kBlockBasedTableWithPrefixHashIndex = 1,
     kBlockBasedTableWithWholeKeyHashIndex = 2,
@@ -620,14 +620,16 @@ class DBTestBase : public testing::Test {
     kRowCache = 27,
     kRecycleLogFiles = 28,
     kConcurrentSkipList = 29,
-    kEnd = 30,
-    kLevelSubcompactions = 31,
-    kUniversalSubcompactions = 32,
-    kBlockBasedTableWithIndexRestartInterval = 33,
-    kBlockBasedTableWithPartitionedIndex = 34,
-    kPartitionedFilterWithNewTableReaderForCompactions = 35,
+    kLevelSubcompactions = 30,
+    kUniversalSubcompactions = 31,
+    kBlockBasedTableWithIndexRestartInterval = 32,
+    kBlockBasedTableWithPartitionedIndex = 33,
+    kPartitionedFilterWithNewTableReaderForCompactions = 34,
+    kPipelinedWrite = 35,
+    kConcurrentMemTableWrite = 36,
+    kPipelinedWriteAndConcurrentMemTableWrite = 37,
+    kEnd = 38,
   };
-  int option_config_;
 
  public:
   std::string dbname_;
@@ -638,6 +640,7 @@ class DBTestBase : public testing::Test {
   DB* db_;
   std::vector<ColumnFamilyHandle*> handles_;
 
+  int option_config_;
   Options last_options_;
 
   // Skip some options, as they may not be applicable to a specific test.
@@ -688,12 +691,19 @@ class DBTestBase : public testing::Test {
   bool ChangeFilterOptions();
 
   // Return the current option configuration.
-  Options CurrentOptions(
-      const anon::OptionsOverride& options_override = anon::OptionsOverride());
+  Options CurrentOptions(const anon::OptionsOverride& options_override =
+                             anon::OptionsOverride()) const;
 
-  Options CurrentOptions(
-      const Options& defaultOptions,
-      const anon::OptionsOverride& options_override = anon::OptionsOverride());
+  Options CurrentOptions(const Options& default_options,
+                         const anon::OptionsOverride& options_override =
+                             anon::OptionsOverride()) const;
+
+  static Options GetDefaultOptions();
+
+  Options GetOptions(int option_config,
+                     const Options& default_options = GetDefaultOptions(),
+                     const anon::OptionsOverride& options_override =
+                         anon::OptionsOverride()) const;
 
   DBImpl* dbfull() { return reinterpret_cast<DBImpl*>(db_); }
 
