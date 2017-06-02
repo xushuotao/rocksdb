@@ -867,15 +867,17 @@ Status BlobDBImpl::SingleDelete(const WriteOptions& wopts,
 }
 
 Status BlobDBImpl::Write(const WriteOptions& opts, WriteBatch* updates) {
-  class Handler1 : public WriteBatch::Handler {
+  class BlobInserter : public WriteBatch::Handler {
    public:
-    explicit Handler1(BlobDBImpl* i) : impl(i), previous_put(false) {}
+    explicit BlobInserter(BlobDBImpl* i, SequenceNumber seq)
+        : impl(i), sequence(seq), has_put(false) {}
 
     BlobDBImpl* impl;
+    SequenceNumber sequence;
     WriteBatch updates_blob;
     Status batch_rewrite_status;
     std::shared_ptr<BlobFile> last_file;
-    bool previous_put;
+    bool has_put;
 
     virtual Status PutCF(uint32_t column_family_id, const Slice& key,
                          const Slice& value_unc) override {
@@ -906,6 +908,9 @@ Status BlobDBImpl::Write(const WriteOptions& opts, WriteBatch* updates) {
         return batch_rewrite_status;
       }
 
+      last_file = bfile;
+      has_put = true;
+
       Slice value = value_unc;
       std::string compression_output;
       if (impl->bdb_options_.compression != kNoCompression) {
@@ -918,28 +923,38 @@ Status BlobDBImpl::Write(const WriteOptions& opts, WriteBatch* updates) {
 
       std::string headerbuf;
       Writer::ConstructBlobHeader(&headerbuf, key, value, expiration, -1);
-
-      if (previous_put) {
-        impl->AppendSN(last_file, 0 /*sequence number*/);
-        previous_put = false;
-      }
-
-      last_file = bfile;
-
       std::string index_entry;
       Status st = impl->AppendBlob(bfile, headerbuf, key, value, &index_entry);
+      if (st.ok()) {
+        impl->AppendSN(last_file, sequence);
+        sequence++;
+      }
 
-      if (expiration != -1)
+      if (expiration != -1) {
         extendTTL(&(bfile->ttl_range_), (uint32_t)expiration);
+      }
 
       if (!st.ok()) {
         batch_rewrite_status = st;
       } else {
-        previous_put = true;
         WriteBatchInternal::Put(&updates_blob, column_family_id, key,
                                 index_entry);
       }
       return Status::OK();
+    }
+
+    virtual Status DeleteCF(uint32_t column_family_id,
+                            const Slice& key) override {
+      WriteBatchInternal::Delete(&updates_blob, column_family_id, key);
+      sequence++;
+      return Status::OK();
+    }
+
+    virtual Status SingleDeleteCF(uint32_t column_family_id,
+                                  const Slice& key) override {
+      batch_rewrite_status =
+          Status::NotSupported("Not supported operation in blob db.");
+      return batch_rewrite_status;
     }
 
     virtual Status MergeCF(uint32_t column_family_id, const Slice& key,
@@ -949,65 +964,58 @@ Status BlobDBImpl::Write(const WriteOptions& opts, WriteBatch* updates) {
       return batch_rewrite_status;
     }
 
-    virtual Status DeleteCF(uint32_t column_family_id,
-                            const Slice& key) override {
-      WriteBatchInternal::Delete(&updates_blob, column_family_id, key);
-      return Status::OK();
-    }
-
     virtual void LogData(const Slice& blob) override {
       updates_blob.PutLogData(blob);
     }
-
-   private:
   };
 
-  Handler1 handler1(this);
-  updates->Iterate(&handler1);
+  SequenceNumber sequence = db_impl_->GetLatestSequenceNumber() + 1;
+  BlobInserter blob_inserter(this, sequence);
+  updates->Iterate(&blob_inserter);
 
-  Status s;
-  SequenceNumber lsn = db_impl_->GetLatestSequenceNumber();
-
-  if (!handler1.batch_rewrite_status.ok()) {
-    return handler1.batch_rewrite_status;
-  } else {
-    s = db_->Write(opts, &(handler1.updates_blob));
+  if (!blob_inserter.batch_rewrite_status.ok()) {
+    return blob_inserter.batch_rewrite_status;
   }
 
-  if (!s.ok()) return s;
+  Status s = db_->Write(opts, &(blob_inserter.updates_blob));
+  if (!s.ok()) {
+    return s;
+  }
 
-  if (handler1.previous_put) {
-    // this is the sequence number of the write.
-    SequenceNumber sn = WriteBatchInternal::Sequence(&handler1.updates_blob) +
-                        WriteBatchInternal::Count(&handler1.updates_blob) - 1;
-    AppendSN(handler1.last_file, sn);
-
-    CloseIf(handler1.last_file);
+  if (blob_inserter.has_put) {
+    CloseIf(blob_inserter.last_file);
   }
 
   // add deleted key to list of keys that have been deleted for book-keeping
-  class Handler2 : public WriteBatch::Handler {
+  class DeleteBookkeeper : public WriteBatch::Handler {
    public:
-    explicit Handler2(BlobDBImpl* i, const SequenceNumber& sn)
-        : impl(i), lsn(sn) {}
+    explicit DeleteBookkeeper(BlobDBImpl* impl, const SequenceNumber& sequence)
+        : impl_(impl), sequence_(sequence) {}
+
+    virtual Status PutCF(uint32_t column_family_id, const Slice& key,
+                         const Slice& value) override {
+      sequence_++;
+      return Status::OK();
+    }
 
     virtual Status DeleteCF(uint32_t column_family_id,
                             const Slice& key) override {
       ColumnFamilyHandle* cfh =
-          impl->db_impl_->GetColumnFamilyHandleUnlocked(column_family_id);
+          impl_->db_impl_->GetColumnFamilyHandleUnlocked(column_family_id);
 
-      impl->delete_keys_q_.enqueue({cfh, key.ToString(), lsn});
+      impl_->delete_keys_q_.enqueue({cfh, key.ToString(), sequence_});
+      sequence_++;
       return Status::OK();
     }
 
    private:
-    BlobDBImpl* impl;
-    SequenceNumber lsn;
+    BlobDBImpl* impl_;
+    SequenceNumber sequence_;
   };
 
   // add deleted key to list of keys that have been deleted for book-keeping
-  Handler2 handler2(this, lsn);
-  updates->Iterate(&handler2);
+  DeleteBookkeeper delete_bookkeeper(this, sequence);
+  updates->Iterate(&delete_bookkeeper);
 
   return Status::OK();
 }
